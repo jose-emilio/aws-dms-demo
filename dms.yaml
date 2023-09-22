@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Plantilla para la creación de 3 VPCs, la VPC A contiene una instancia EC2 con MariaDB (origen), la VPC C contiene una instancia RDS con PostgreSQL y la VPC B una instancia de replicacion de AWS DMS. La comunicacion entre VPCs se produce mediante interconexiones de VPC
+Parameters:
+  AmiID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: ID de la AMI
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2'
+  CIDRA:
+    Type: String
+    Description: Bloque CIDR de la VPC-A. No deberia solaparse con el rango de la VPC-B ni la VPC-C
+    Default: '10.0.0.0/16'
+  CIDRB:
+    Type: String
+    Description: Bloque CIDR de la VPC-B. No deberia solaparse con el rango de la VPC-A ni la VPC-C
+    Default: '10.1.0.0/16'
+  CIDRC:
+    Type: String
+    Description: Bloque CIDR de la VPC-C. No deberia solaparse con el rango de la VPC-A ni la VPC-B
+    Default: '10.2.0.0/16'
+  TipoInstanciaReplicacion:
+    Type: String
+    Description: Tipo de instancia de replicacion de AWS DMS
+    AllowedValues:
+         - dms.t3.micro
+         - dms.t3.small
+         - dms.t3.medium
+         - dms.t3.large
+    Default: dms.t3.small
+  UsuarioOrigen:
+    Type: String
+    Description: Usuario de la BD origen
+    Default: dbuser
+  UsuarioDestino:
+    Type: String
+    Description: Usuario de la BD destino
+    Default: dbuser
+  PassOrigen:
+    Type: String
+    Description: Password Usuario de la BD origen
+    NoEcho: true
+    Default: dbpass
+  PassDestino:
+    Type: String
+    Description: Password Usuario de la BD destino. Debe tener mas de 8 caracteres
+    NoEcho: true
+    Default: dbpassadmin
+  BucketRutaOrigenScripts:
+    Type: String
+    Description: Bucket y prefijo donde se encuentran los scripts de creacion de la BD. El bucket de S3 debe existir en la region
+    Default: aai-joseemilio/Demos/DMS
+  ObjetoOrigenScripts:
+    Type: String
+    Description: Nombre del objeto de S3 con fichero zip donde se encuentran los scripts de creacion de la BD. Debe existir en el bucket de origen
+    Default: database.zip
+Resources:
+  VPCA:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        Nombre: A
+        VPC: !Ref CIDRA
+        SubredesPublicas: 'SI'
+        SubredesPrivadas: 'NO'
+        SubredPublica1: !Select [ 0, !Cidr [ !Ref CIDRA, 2, 8 ]]
+        SubredPublica2: !Select [ 1, !Cidr [ !Ref CIDRA, 2, 8 ]]
+        NATGateways: 'NO'
+        Bastion: 'NO'
+      TemplateURL: ./vpc.yaml
+  VPCB:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        Nombre: B
+        VPC: !Ref CIDRB
+        SubredesPublicas: 'NO'
+        SubredesPrivadas: 'SI'
+        SubredPrivada1: !Select [ 0, !Cidr [ !Ref CIDRB, 2, 8 ]]
+        SubredPrivada2: !Select [ 1, !Cidr [ !Ref CIDRB, 2, 8 ]]
+        NATGateways: 'NO'
+        Bastion: 'NO'
+      TemplateURL: ./vpc.yaml
+  VPCC:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        Nombre: C
+        VPC: !Ref CIDRC
+        SubredesPublicas: 'SI'
+        SubredesPrivadas: 'NO'
+        SubredPublica1: !Select [ 0, !Cidr [ !Ref CIDRC, 2, 8 ]]
+        SubredPublica2: !Select [ 1, !Cidr [ !Ref CIDRC, 2, 8 ]]
+        NATGateways: 'NO'
+        Bastion: 'NO'
+      TemplateURL: ./vpc.yaml
+  PeeringAB:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties: 
+      PeerVpcId: !GetAtt VPCA.Outputs.VPC
+      VpcId: !GetAtt VPCB.Outputs.VPC
+  PeeringBC:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties: 
+      PeerVpcId: !GetAtt VPCC.Outputs.VPC
+      VpcId: !GetAtt VPCB.Outputs.VPC
+  RutaAB:
+    Type: AWS::EC2::Route
+    Properties:
+         RouteTableId: !GetAtt VPCA.Outputs.TablaRutasPublica
+         DestinationCidrBlock: !Ref CIDRB
+         VpcPeeringConnectionId: !Ref PeeringAB
+  RutaBA1:
+    Type: AWS::EC2::Route
+    Properties:
+         RouteTableId: !GetAtt VPCB.Outputs.TablaRutasPrivada1
+         DestinationCidrBlock: !Ref CIDRA
+         VpcPeeringConnectionId: !Ref PeeringAB
+  RutaBA2:
+    Type: AWS::EC2::Route
+    Properties:
+         RouteTableId: !GetAtt VPCB.Outputs.TablaRutasPrivada2
+         DestinationCidrBlock: !Ref CIDRA
+         VpcPeeringConnectionId: !Ref PeeringAB
+  RutaCB:
+    Type: AWS::EC2::Route
+    Properties:
+         RouteTableId: !GetAtt VPCC.Outputs.TablaRutasPublica
+         DestinationCidrBlock: !Ref CIDRB
+         VpcPeeringConnectionId: !Ref PeeringBC
+  RutaBC1:
+    Type: AWS::EC2::Route
+    Properties:
+         RouteTableId: !GetAtt VPCB.Outputs.TablaRutasPrivada1
+         DestinationCidrBlock: !Ref CIDRC
+         VpcPeeringConnectionId: !Ref PeeringBC
+  RutaBC2:
+    Type: AWS::EC2::Route
+    Properties:
+         RouteTableId: !GetAtt VPCB.Outputs.TablaRutasPrivada2
+         DestinationCidrBlock: !Ref CIDRC
+         VpcPeeringConnectionId: !Ref PeeringBC
+  RolInstanciasEC2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+  PerfilInstanciasEC2:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref RolInstanciasEC2
+  GrupoSeguridadMariaDB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Trafico para la instancia MariaDB
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 3306
+          ToPort: 3306
+      VpcId: !GetAtt VPCA.Outputs.VPC
+  GrupoSeguridadMySQL:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      GroupDescription: Trafico para la instancia RDS MySQL
+      DBSecurityGroupIngress:
+        - CIDRIP: 0.0.0.0/0
+      EC2VpcId: !GetAtt VPCC.Outputs.VPC
+  GrupoSubredesDMS:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupDescription: Grupo de subredes privadas para la instancia de replicacion de AWS DMS
+      SubnetIds:
+        - !GetAtt VPCB.Outputs.Privada1
+        - !GetAtt VPCB.Outputs.Privada2
+  InstanciaReplicacion:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+         ReplicationInstanceClass: !Ref TipoInstanciaReplicacion
+         ReplicationSubnetGroupIdentifier: !Ref GrupoSubredesDMS
+         PubliclyAccessible: no
+  InstanciaEC2Origen:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t4g.small
+      ImageId: !Ref AmiID
+      SubnetId: !GetAtt VPCA.Outputs.Publica1
+      IamInstanceProfile: !Ref PerfilInstanciasEC2
+      SecurityGroupIds:
+        - !Ref GrupoSeguridadMariaDB
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          yum update -y
+          yum install -y mariadb-server 
+          systemctl enable mariadb
+          systemctl start mariadb
+          aws s3 cp s3://${BucketRutaOrigenScripts}/${ObjetoOrigenScripts} .
+          unzip ${ObjetoOrigenScripts}
+          mysql -uroot < schema.sql
+          mysql -uroot < database.sql
+          mysql -uroot -e "CREATE USER '${UsuarioOrigen}'@'%' IDENTIFIED BY '${PassOrigen}';GRANT ALL PRIVILEGES ON sakila.* TO '${UsuarioOrigen}'@'%' IDENTIFIED BY '${PassOrigen}';FLUSH PRIVILEGES;"
+  PuntoEnlaceOrigen:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointType: source
+      EngineName: mariadb
+      ServerName: !GetAtt InstanciaEC2Origen.PrivateDnsName
+      Username: !Ref UsuarioOrigen
+      Password: !Ref PassOrigen
+      Port: 3306
+  GrupoSubredesRDS:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+         DBSubnetGroupDescription: Grupo de subredes para la instancia RDS destino donde se replicara la BD origen
+         SubnetIds:
+            - !GetAtt VPCC.Outputs.Publica1
+            - !GetAtt VPCC.Outputs.Publica2
+  InstanciaDestino:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 20
+      StorageType: gp2
+      DBInstanceClass: db.t3.small
+      Engine: mysql
+      DBName: sakila
+      MasterUsername: !Ref UsuarioDestino
+      MasterUserPassword: !Ref PassDestino
+      DBSecurityGroups:
+        - !Ref GrupoSeguridadMySQL
+      DBSubnetGroupName: !Ref GrupoSubredesRDS
+  PuntoEnlaceDestino:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointType: target
+      EngineName: mysql
+      ServerName: !GetAtt InstanciaDestino.Endpoint.Address
+      Username: !Ref UsuarioDestino
+      Password: !Ref PassDestino
+      Port: 3306
+      DatabaseName: sakila
